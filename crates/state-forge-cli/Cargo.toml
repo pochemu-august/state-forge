@@ -1,0 +1,12 @@
+[package]
+name = "state-forge-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+state-forge-common = { path = "../state-forge-common" }
+state-forge-injector = { path = "../state-forge-injector" }
+tokio = { workspace = true }
+bincode = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
