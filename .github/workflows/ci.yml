@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build, Lint & Test (Windows x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Code style check (rustfmt)
+        run: cargo fmt --all -- --check
+
+      - name: Lint and static analysis (clippy)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Workspace compilation check
+        run: cargo check --workspace --all-targets
+
+      - name: Run unit & integration tests
+        run: cargo test --workspace --verbose
+
+      - name: Build all targets
+        run: cargo build --workspace --verbose
