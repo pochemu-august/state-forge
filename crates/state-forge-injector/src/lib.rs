@@ -118,3 +118,32 @@ pub fn inject_dll(pid: u32, dll_path: &Path) -> Result<(), String> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_inject_nonexistent_dll() {
+        let res = inject_dll(1234, Path::new("non_existent_state_forge_xyz.dll"));
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Не удалось канонизировать"));
+    }
+
+    #[test]
+    fn test_inject_invalid_pid() {
+        // Создаем временный существующий файл, чтобы проверка пути прошла
+        let temp_dir = std::env::temp_dir();
+        let dummy_path = temp_dir.join("state_forge_test_dummy.dll");
+        let _ = std::fs::write(&dummy_path, b"DUMMY");
+
+        // Несуществующий PID в Windows
+        let invalid_pid = 0xFFFF_FFFE;
+        let res = inject_dll(invalid_pid, &dummy_path);
+        let _ = std::fs::remove_file(&dummy_path);
+
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("OpenProcess"));
+    }
+}

@@ -103,4 +103,55 @@ mod tests {
             _ => panic!("Expected Data payload"),
         }
     }
+
+    #[test]
+    fn test_serialize_deserialize_close_event() {
+        let event = InterceptedEvent {
+            pid: 1234,
+            timestamp_millis: 1700002000,
+            payload: NetworkEventPayload::Close { socket: 300 },
+        };
+
+        let encoded = bincode::serialize(&event).expect("Serialization failed");
+        let decoded: InterceptedEvent =
+            bincode::deserialize(&encoded).expect("Deserialization failed");
+
+        assert_eq!(decoded.pid, 1234);
+        match decoded.payload {
+            NetworkEventPayload::Close { socket } => {
+                assert_eq!(socket, 300);
+            }
+            _ => panic!("Expected Close payload"),
+        }
+    }
+
+    #[test]
+    fn test_serialize_deserialize_ipv6_connect() {
+        let event = InterceptedEvent {
+            pid: 5678,
+            timestamp_millis: 1700003000,
+            payload: NetworkEventPayload::Connect {
+                socket: 400,
+                remote_addr: "[::1]:9000".parse().ok(),
+                success: false,
+            },
+        };
+
+        let encoded = bincode::serialize(&event).expect("Serialization failed");
+        let decoded: InterceptedEvent =
+            bincode::deserialize(&encoded).expect("Deserialization failed");
+
+        match decoded.payload {
+            NetworkEventPayload::Connect {
+                socket,
+                remote_addr,
+                success,
+            } => {
+                assert_eq!(socket, 400);
+                assert_eq!(remote_addr, "[::1]:9000".parse().ok());
+                assert!(!success);
+            }
+            _ => panic!("Expected Connect payload"),
+        }
+    }
 }

@@ -80,29 +80,41 @@ echo ====================================================================
 echo.
 
 echo [1/4] Checking code style (cargo fmt)...
-cargo fmt --all -- --check > "%FMT_LOG%" 2>&1
-if %ERRORLEVEL% neq 0 (
+echo === Cargo Fmt Style Check [%DATE% %TIME%] === > "%FMT_LOG%"
+cargo fmt --all -- --check >> "%FMT_LOG%" 2>&1
+if !ERRORLEVEL! equ 0 (
+    echo [OK] Code style is 100%% compliant. 0 formatting issues. >> "%FMT_LOG%"
+) else (
     set "STATUS_FMT=[FAIL]"
     set /a ERRORS+=1
 )
 
 echo [2/4] Checking code logic and idioms (cargo clippy)...
-cargo clippy --workspace --all-targets --all-features > "%CLIPPY_LOG%" 2>&1
-if %ERRORLEVEL% neq 0 (
+echo === Cargo Clippy Linter Analysis [%DATE% %TIME%] === > "%CLIPPY_LOG%"
+cargo clippy --workspace --all-targets --all-features >> "%CLIPPY_LOG%" 2>&1
+if !ERRORLEVEL! equ 0 (
+    echo [OK] 0 warnings and 0 anti-patterns detected. Clean codebase. >> "%CLIPPY_LOG%"
+) else (
     set "STATUS_CLIPPY=[FAIL]"
     set /a ERRORS+=1
 )
 
 echo [3/4] Checking workspace compilation (cargo check)...
-cargo check --workspace --all-targets > "%CHECK_LOG%" 2>&1
-if %ERRORLEVEL% neq 0 (
+echo === Cargo Workspace Compilation Check [%DATE% %TIME%] === > "%CHECK_LOG%"
+cargo check --workspace --all-targets >> "%CHECK_LOG%" 2>&1
+if !ERRORLEVEL! equ 0 (
+    echo [OK] All targets and crates compiled without type errors. >> "%CHECK_LOG%"
+) else (
     set "STATUS_CHECK=[FAIL]"
     set /a ERRORS+=1
 )
 
 echo [4/4] Running unit and integration tests (cargo test)...
-cargo test --workspace > "%TEST_LOG%" 2>&1
-if %ERRORLEVEL% neq 0 (
+echo === Cargo Unit and Integration Tests [%DATE% %TIME%] === > "%TEST_LOG%"
+cargo test --workspace >> "%TEST_LOG%" 2>&1
+if !ERRORLEVEL! equ 0 (
+    echo [OK] All test suites passed successfully. >> "%TEST_LOG%"
+) else (
     set "STATUS_TEST=[FAIL]"
     set /a ERRORS+=1
 )

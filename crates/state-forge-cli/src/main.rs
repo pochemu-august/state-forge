@@ -1,4 +1,6 @@
 use state_forge_common::{InterceptedEvent, NetworkDirection, NetworkEventPayload};
+use std::fs::{OpenOptions, create_dir_all};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncReadExt;
 use tokio::net::windows::named_pipe::ServerOptions;
@@ -6,7 +8,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 /// Поиск собранной библиотеки хука
-fn resolve_hook_dll() -> Option<PathBuf> {
+pub fn resolve_hook_dll() -> Option<PathBuf> {
     let candidates = [
         PathBuf::from("target/debug/state_forge_hook.dll"),
         PathBuf::from("target/release/state_forge_hook.dll"),
@@ -26,7 +28,7 @@ fn resolve_hook_dll() -> Option<PathBuf> {
 }
 
 /// Вывод hex-дампа буфера
-fn format_hex_dump(bytes: &[u8], max_len: usize) -> String {
+pub fn format_hex_dump(bytes: &[u8], max_len: usize) -> String {
     let display_len = bytes.len().min(max_len);
     let hex_part: Vec<String> = bytes[..display_len]
         .iter()
@@ -76,7 +78,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pid: u32 = args[1].parse().map_err(|_| "Некорректный PID")?;
     let pipe_name = format!(r"\\.\pipe\state_forge_{}", pid);
 
+    // Подготовка директории и файлов для сохранения логов трафика
+    let log_dir = Path::new("logs");
+    let _ = create_dir_all(log_dir);
+    let text_log_path = log_dir.join(format!("traffic_{}.log", pid));
+    let jsonl_log_path = log_dir.join(format!("traffic_{}.jsonl", pid));
+
     info!(pid = pid, pipe = %pipe_name, "Инициализация Named Pipe сервера...");
+    info!(
+        log_file = %text_log_path.display(),
+        jsonl_file = %jsonl_log_path.display(),
+        "Логирование перехваченного трафика будет сохранено в файлы"
+    );
+
+    let mut text_log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&text_log_path)
+        .ok();
+
+    let mut jsonl_log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&jsonl_log_path)
+        .ok();
 
     // Создаем экземпляр Named Pipe сервера
     let pipe_server = ServerOptions::new()
@@ -99,18 +124,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Фоновая задача логирования и анализа
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            match event.payload {
+            // Сохранение машиночитаемого JSONL для будущего стейт-машин парсера
+            if let Some(ref mut jfile) = jsonl_log_file
+                && let Ok(json_str) = serde_json::to_string(&event)
+            {
+                let _ = writeln!(jfile, "{}", json_str);
+                let _ = jfile.flush();
+            }
+
+            match &event.payload {
                 NetworkEventPayload::Connect {
                     socket,
                     remote_addr,
                     success,
                 } => {
+                    let log_line = format!(
+                        "[{}] CONNECT socket={} remote={:?} success={}",
+                        event.timestamp_millis, socket, remote_addr, success
+                    );
                     info!(
                         socket = socket,
                         remote = ?remote_addr,
                         success = success,
                         "🔗 [CONNECT] Попытка сетевого соединения"
                     );
+                    if let Some(ref mut tfile) = text_log_file {
+                        let _ = writeln!(tfile, "{}", log_line);
+                        let _ = tfile.flush();
+                    }
                 }
                 NetworkEventPayload::Data {
                     socket,
@@ -121,8 +162,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         NetworkDirection::Tx => "TX >>> (SEND)",
                         NetworkDirection::Rx => "RX <<< (RECV)",
                     };
-                    let dump = format_hex_dump(&bytes, 48);
+                    let dump = format_hex_dump(bytes, 48);
 
+                    let log_line = format!(
+                        "[{}] DATA socket={} dir={} bytes={} dump={}",
+                        event.timestamp_millis,
+                        socket,
+                        dir_str,
+                        bytes.len(),
+                        dump
+                    );
                     info!(
                         socket = socket,
                         dir = dir_str,
@@ -130,9 +179,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dump = %dump,
                         "📦 [PACKET]"
                     );
+                    if let Some(ref mut tfile) = text_log_file {
+                        let _ = writeln!(tfile, "{}", log_line);
+                        let _ = tfile.flush();
+                    }
                 }
                 NetworkEventPayload::Close { socket } => {
+                    let log_line = format!("[{}] CLOSE socket={}", event.timestamp_millis, socket);
                     info!(socket = socket, "🔌 [CLOSE] Сокет закрыт");
+                    if let Some(ref mut tfile) = text_log_file {
+                        let _ = writeln!(tfile, "{}", log_line);
+                        let _ = tfile.flush();
+                    }
                 }
             }
         }
@@ -170,4 +228,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Целевой процесс отключился или соединение разорвано.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_hex_dump_short() {
+        let data = b"Hello";
+        let formatted = format_hex_dump(data, 10);
+        assert_eq!(formatted, "48 65 6C 6C 6F [ASCII: Hello]");
+    }
+
+    #[test]
+    fn test_format_hex_dump_truncated() {
+        let data = b"1234567890";
+        let formatted = format_hex_dump(data, 4);
+        assert!(formatted.contains("31 32 33 34 ..."));
+        assert!(formatted.contains("(+6 bytes)"));
+    }
+
+    #[test]
+    fn test_format_hex_dump_non_printable() {
+        let data = &[0x00, 0x01, 0xFF, 0x20, 0x41];
+        let formatted = format_hex_dump(data, 10);
+        assert_eq!(formatted, "00 01 FF 20 41 [ASCII: ... A]");
+    }
 }
