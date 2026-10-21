@@ -438,4 +438,28 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_check_is_stream_socket_real_sockets() {
+        use std::net::{TcpListener, UdpSocket};
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::INVALID_SOCKET;
+
+        // 1. Реальный TCP сокет — тип SOCK_STREAM
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
+        let tcp_sock = tcp_listener.as_raw_socket() as SOCKET;
+        // Убивает мутанта: `replace check_is_stream_socket -> bool with false`
+        assert!(check_is_stream_socket(tcp_sock));
+
+        // 2. Реальный UDP сокет — тип SOCK_DGRAM
+        let udp_socket = UdpSocket::bind("127.0.0.1:0").expect("bind udp socket");
+        let udp_sock = udp_socket.as_raw_socket() as SOCKET;
+        // Убивает мутанта: `replace check_is_stream_socket -> bool with true`
+        assert!(!check_is_stream_socket(udp_sock));
+
+        // 3. Невалидный дескриптор сокета (getsockopt завершится с ошибкой SOCKET_ERROR)
+        // Убивает мутантов: `replace && with ||` и `replace == with !=` в check_is_stream_socket
+        assert!(!check_is_stream_socket(INVALID_SOCKET));
+    }
 }

@@ -457,4 +457,135 @@ mod tests {
         let eof = read_frame(&mut cursor).unwrap();
         assert!(eof.is_none());
     }
+
+    #[test]
+    fn test_validate_frame_len_boundaries() {
+        // Убивает мутанта: `replace > with >= in validate_frame_len`
+        // Ровно MAX_FRAME_LEN — допустимый размер кадра!
+        assert!(validate_frame_len(MAX_FRAME_LEN).is_ok());
+        assert!(validate_frame_len(MAX_FRAME_LEN - 1).is_ok());
+        assert!(validate_frame_len(0).is_ok());
+
+        // Превышение границы строго на 1 байт должно давать ошибку
+        let err = validate_frame_len(MAX_FRAME_LEN + 1).unwrap_err();
+        match err {
+            FrameError::FrameTooLarge { len, max } => {
+                assert_eq!(len, MAX_FRAME_LEN + 1);
+                assert_eq!(max, MAX_FRAME_LEN);
+            }
+            _ => panic!("Expected FrameTooLarge, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_frame_error_display_and_source() {
+        use std::error::Error;
+
+        // 1. FrameError::Io
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "disk failure");
+        let err_io: FrameError = io_err.into();
+        // Убивает мутанта: `replace <impl Display for FrameError>::fmt with Ok(Default::default())`
+        assert_eq!(err_io.to_string(), "I/O error: disk failure");
+        // Убивает мутанта: `replace <impl Error for FrameError>::source with None`
+        assert!(err_io.source().is_some());
+        assert_eq!(
+            err_io
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        // 2. FrameError::Bincode
+        let bad_bytes = [0xFF; 2];
+        let bincode_err = bincode::deserialize::<InterceptedEvent>(&bad_bytes).unwrap_err();
+        let expected_msg = format!("Bincode error: {}", bincode_err);
+        let err_bincode: FrameError = bincode_err.into();
+        assert_eq!(err_bincode.to_string(), expected_msg);
+        assert!(err_bincode.source().is_some());
+
+        // 3. FrameError::FrameTooLarge
+        let err_large = FrameError::FrameTooLarge { len: 200, max: 100 };
+        assert_eq!(
+            err_large.to_string(),
+            "Frame length 200 exceeds maximum allowed length 100"
+        );
+        assert!(err_large.source().is_none());
+
+        // 4. FrameError::TrailingBytes
+        let err_trailing = FrameError::TrailingBytes {
+            consumed: 10,
+            total: 15,
+        };
+        assert_eq!(
+            err_trailing.to_string(),
+            "Frame payload had trailing bytes (consumed 10, total 15)"
+        );
+        assert!(err_trailing.source().is_none());
+    }
+
+    struct InterruptedThenDataReader<R> {
+        inner: R,
+        interrupted_injected: bool,
+    }
+
+    impl<R: Read> Read for InterruptedThenDataReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted_injected {
+                self.interrupted_injected = true;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "simulated EINTR",
+                ));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn test_read_frame_interrupted_retry() {
+        // Убивает мутанта: `replace match guard e.kind() == Interrupted with false`
+        let event = InterceptedEvent {
+            pid: 999,
+            seq: 1,
+            timestamp_millis: 12345,
+            payload: NetworkEventPayload::Close { socket: 42 },
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &event).unwrap();
+
+        let mut reader = InterruptedThenDataReader {
+            inner: Cursor::new(buf),
+            interrupted_injected: false,
+        };
+
+        // read_frame обязан проглотить ErrorKind::Interrupted и продолжить чтение
+        let result =
+            read_frame(&mut reader).expect("read_frame should succeed after retry on Interrupted");
+        assert_eq!(result, Some(event));
+    }
+
+    struct OtherErrorReader;
+    impl Read for OtherErrorReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "access denied",
+            ))
+        }
+    }
+
+    #[test]
+    fn test_read_frame_non_interrupted_error_fails() {
+        // Убивает мутанта: `replace match guard e.kind() == Interrupted with true`
+        let mut reader = OtherErrorReader;
+        let res = read_frame(&mut reader);
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            FrameError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+            other => panic!("Expected FrameError::Io, got {:?}", other),
+        }
+    }
 }

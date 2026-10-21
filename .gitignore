@@ -2,3 +2,4 @@
 /logs
 *.log
 /mutants.out
+/mutants.out.old
