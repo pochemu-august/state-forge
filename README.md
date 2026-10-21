@@ -63,13 +63,22 @@ cargo build --workspace
 analyze.bat run
 ```
 
-### 3. Ручной запуск перехвата существующего процесса
+### 3. Чистая сборка с нуля и запуск (без старых артефактов и логов)
+```cmd
+analyze.bat clean run
+```
+
+### 4. Ручной запуск перехвата существующего процесса
 ```cmd
 cargo run -p state-forge-cli -- <PID>
 ```
 Или через скрипт:
 ```cmd
 analyze.bat run <PID>
+```
+Или с предварительной очисткой:
+```cmd
+analyze.bat clean run <PID>
 ```
 
 ---

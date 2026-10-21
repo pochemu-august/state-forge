@@ -37,6 +37,9 @@ pub struct InterceptedEvent {
     pub payload: NetworkEventPayload,
 }
 
+pub mod frame;
+pub use frame::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,7 +51,7 @@ mod tests {
             timestamp_millis: 1700000000,
             payload: NetworkEventPayload::Connect {
                 socket: 100,
-                remote_addr: "127.0.0.1:8080".parse().ok(),
+                remote_addr: Some("127.0.0.1:8080".parse().unwrap()),
                 success: true,
             },
         };
@@ -66,7 +69,7 @@ mod tests {
                 success,
             } => {
                 assert_eq!(socket, 100);
-                assert_eq!(remote_addr, "127.0.0.1:8080".parse().ok());
+                assert_eq!(remote_addr, Some("127.0.0.1:8080".parse().unwrap()));
                 assert!(success);
             }
             _ => panic!("Expected Connect payload"),
@@ -105,6 +108,38 @@ mod tests {
     }
 
     #[test]
+    fn test_serialize_deserialize_data_event_rx() {
+        let event = InterceptedEvent {
+            pid: 9998,
+            timestamp_millis: 1700001050,
+            payload: NetworkEventPayload::Data {
+                socket: 201,
+                direction: NetworkDirection::Rx,
+                bytes: b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
+            },
+        };
+
+        let encoded = bincode::serialize(&event).expect("Serialization failed");
+        let decoded: InterceptedEvent =
+            bincode::deserialize(&encoded).expect("Deserialization failed");
+
+        assert_eq!(decoded.pid, 9998);
+        assert_eq!(decoded.timestamp_millis, 1700001050);
+        match decoded.payload {
+            NetworkEventPayload::Data {
+                socket,
+                direction,
+                bytes,
+            } => {
+                assert_eq!(socket, 201);
+                assert_eq!(direction, NetworkDirection::Rx);
+                assert_eq!(&bytes, b"HTTP/1.1 200 OK\r\n\r\n");
+            }
+            _ => panic!("Expected Data payload"),
+        }
+    }
+
+    #[test]
     fn test_serialize_deserialize_close_event() {
         let event = InterceptedEvent {
             pid: 1234,
@@ -132,7 +167,7 @@ mod tests {
             timestamp_millis: 1700003000,
             payload: NetworkEventPayload::Connect {
                 socket: 400,
-                remote_addr: "[::1]:9000".parse().ok(),
+                remote_addr: Some("[::1]:9000".parse().unwrap()),
                 success: false,
             },
         };
@@ -148,7 +183,7 @@ mod tests {
                 success,
             } => {
                 assert_eq!(socket, 400);
-                assert_eq!(remote_addr, "[::1]:9000".parse().ok());
+                assert_eq!(remote_addr, Some("[::1]:9000".parse().unwrap()));
                 assert!(!success);
             }
             _ => panic!("Expected Connect payload"),

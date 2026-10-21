@@ -1,18 +1,57 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-if /i "%~1"=="run" goto :CMD_RUN
+REM Argument parsing
 if /i "%~1"=="help" goto :CMD_HELP
 if /i "%~1"=="-h" goto :CMD_HELP
 if /i "%~1"=="--help" goto :CMD_HELP
+
+if /i "%~1"=="clean" (
+    call :DO_CLEAN
+    if /i "%~2"=="run" (
+        set "PID_ARG=%~3"
+        goto :CMD_RUN
+    )
+    exit /b 0
+)
+
+if /i "%~1"=="run" (
+    if /i "%~2"=="clean" (
+        call :DO_CLEAN
+        set "PID_ARG=%~3"
+        goto :CMD_RUN
+    )
+    set "PID_ARG=%~2"
+    goto :CMD_RUN
+)
+
 goto :CMD_ANALYZE
+
+:DO_CLEAN
+echo.
+echo ====================================================================
+echo   state-forge: Cleaning Build Artifacts and Logs
+echo ====================================================================
+echo.
+echo [*] Running cargo clean...
+cargo clean
+if exist logs (
+    echo [*] Removing old log files from logs/...
+    del /q logs\*.log 2>nul
+    del /q logs\*.jsonl 2>nul
+)
+echo [OK] Clean completed successfully.
+exit /b 0
 
 :CMD_HELP
 echo.
 echo Usage:
-echo   analyze.bat               - Run full code analysis (fmt, clippy, check, test)
-echo   analyze.bat run           - Interactive run / demo launcher
-echo   analyze.bat run [PID]     - Build and attach interceptor to specific PID
+echo   analyze.bat                   - Run full code audit (fmt, clippy, check, test)
+echo   analyze.bat clean             - Clean build cache and old logs
+echo   analyze.bat run               - Interactive run / demo launcher
+echo   analyze.bat run [PID]         - Build and attach interceptor to specific PID
+echo   analyze.bat clean run         - Clean workspace, rebuild from scratch and launch
+echo   analyze.bat clean run [PID]   - Clean workspace, rebuild and attach to PID
 echo.
 exit /b 0
 
@@ -29,7 +68,6 @@ if %ERRORLEVEL% neq 0 (
     exit /b %ERRORLEVEL%
 )
 
-set "PID_ARG=%~2"
 if not "%PID_ARG%"=="" goto :DO_ATTACH
 
 echo.
