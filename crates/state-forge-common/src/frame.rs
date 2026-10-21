@@ -459,6 +459,13 @@ mod tests {
     }
 
     #[test]
+    fn test_max_frame_len_exact_value() {
+        // Убивает мутантов: replace * with + в MAX_FRAME_LEN
+        // 16 * 1024 * 1024 = 16_777_216 байт (16 МиБ)
+        assert_eq!(MAX_FRAME_LEN, 16_777_216);
+    }
+
+    #[test]
     fn test_validate_frame_len_boundaries() {
         // Убивает мутанта: `replace > with >= in validate_frame_len`
         // Ровно MAX_FRAME_LEN — допустимый размер кадра!
@@ -567,9 +574,17 @@ mod tests {
         assert_eq!(result, Some(event));
     }
 
-    struct OtherErrorReader;
+    struct OtherErrorReader {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
     impl Read for OtherErrorReader {
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let count = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count > 5 {
+                panic!("Infinite loop detected: read_frame retried on non-interrupted error");
+            }
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "access denied",
@@ -579,8 +594,10 @@ mod tests {
 
     #[test]
     fn test_read_frame_non_interrupted_error_fails() {
-        // Убивает мутанта: `replace match guard e.kind() == Interrupted with true`
-        let mut reader = OtherErrorReader;
+        // Убивает мутантов: `replace match guard e.kind() == Interrupted with true` и `replace == with !=`
+        let mut reader = OtherErrorReader {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        };
         let res = read_frame(&mut reader);
         assert!(res.is_err());
         match res.unwrap_err() {

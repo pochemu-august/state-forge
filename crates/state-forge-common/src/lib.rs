@@ -52,6 +52,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_max_capture_bytes_exact_value() {
+        // Убивает мутантов: replace * with + / replace * with / в MAX_CAPTURE_BYTES
+        // 1024 * 1024 = 1_048_576 байт (1 МиБ)
+        assert_eq!(MAX_CAPTURE_BYTES, 1_048_576);
+    }
+
+    #[test]
     fn test_serialize_deserialize_connect_event() {
         let event = InterceptedEvent {
             pid: 4242,

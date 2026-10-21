@@ -49,19 +49,20 @@ pub fn emit_event_to_writer<W: std::io::Write>(
                 Ok(recovered)
             }
             Err(e) => {
-                let dropped = dropped_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                dropped_counter.fetch_add(1, Ordering::Relaxed);
                 crate::log_diagnostic(&format!(
                     "write_frame error: {}. Total dropped events: {}",
-                    e, dropped
+                    e,
+                    dropped_counter.load(Ordering::Relaxed)
                 ));
                 Err(e)
             }
         }
     } else {
-        let dropped = dropped_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        dropped_counter.fetch_add(1, Ordering::Relaxed);
         crate::log_diagnostic(&format!(
             "IPC pipe not connected. Total dropped events: {}",
-            dropped
+            dropped_counter.load(Ordering::Relaxed)
         ));
         Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "IPC pipe not connected").into())
     }
@@ -69,26 +70,11 @@ pub fn emit_event_to_writer<W: std::io::Write>(
 
 /// Отправка сериализованного события в оркестратор
 pub fn emit_event(event: InterceptedEvent) {
-    let mut client_guard = match PIPE_CLIENT.lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            let dropped = DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
-            crate::log_diagnostic(&format!(
-                "PIPE_CLIENT mutex poisoned. Total dropped events: {}",
-                dropped
-            ));
-            return;
-        }
-    };
-
-    let writer_opt = client_guard.as_mut();
-    if let Ok(recovered) = emit_event_to_writer(writer_opt, &event, &DROPPED_EVENTS)
-        && recovered > 0
-    {
-        crate::log_diagnostic(&format!(
-            "IPC pipe recovered. Note: {} events were dropped during previous errors.",
-            recovered
-        ));
+    if let Ok(mut client_guard) = PIPE_CLIENT.lock() {
+        let writer_opt = client_guard.as_mut();
+        let _ = emit_event_to_writer(writer_opt, &event, &DROPPED_EVENTS);
+    } else {
+        DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -182,9 +168,13 @@ mod tests {
 
         let mut failing = FailingWriter;
         let dropped = AtomicU64::new(0);
-        let res = emit_event_to_writer(Some(&mut failing), &event, &dropped);
-        assert!(res.is_err());
+        let res1 = emit_event_to_writer(Some(&mut failing), &event, &dropped);
+        assert!(res1.is_err());
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
+
+        let res2 = emit_event_to_writer(Some(&mut failing), &event, &dropped);
+        assert!(res2.is_err());
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -198,8 +188,12 @@ mod tests {
         };
 
         let prev_dropped = DROPPED_EVENTS.load(Ordering::Relaxed);
+        emit_event(event.clone());
+        let mid_dropped = DROPPED_EVENTS.load(Ordering::Relaxed);
+        assert_eq!(mid_dropped, prev_dropped + 1);
+
         emit_event(event);
-        let new_dropped = DROPPED_EVENTS.load(Ordering::Relaxed);
-        assert_eq!(new_dropped, prev_dropped + 1);
+        let final_dropped = DROPPED_EVENTS.load(Ordering::Relaxed);
+        assert_eq!(final_dropped, prev_dropped + 2);
     }
 }

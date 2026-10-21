@@ -28,7 +28,7 @@ type SendFn = unsafe extern "system" fn(SOCKET, *const u8, c_int, c_int) -> c_in
 type RecvFn = unsafe extern "system" fn(SOCKET, *mut u8, c_int, c_int) -> c_int;
 type CloseSocketFn = unsafe extern "system" fn(SOCKET) -> c_int;
 
-fn current_timestamp() -> u64 {
+pub(crate) fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -461,5 +461,16 @@ mod tests {
         // 3. Невалидный дескриптор сокета (getsockopt завершится с ошибкой SOCKET_ERROR)
         // Убивает мутантов: `replace && with ||` и `replace == with !=` в check_is_stream_socket
         assert!(!check_is_stream_socket(INVALID_SOCKET));
+    }
+
+    #[test]
+    fn test_current_timestamp_is_reasonable() {
+        // Убивает мутантов: replace current_timestamp -> u64 with 0 / 1
+        let ts = current_timestamp();
+        assert!(
+            ts > 1_700_000_000_000,
+            "Timestamp should be well past year 2023 (> 1_700_000_000_000 ms), got {}",
+            ts
+        );
     }
 }

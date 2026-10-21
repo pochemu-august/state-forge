@@ -1,0 +1,11 @@
+# Configuration for cargo-mutants
+# Exclude low-level OS entry points and system-injection-only functions
+# that depend on external process injection or global OS state and cannot be
+# safely/meaningfully mutated in unit tests.
+exclude_re = [
+    "DllMain",
+    "get_dll_dir",
+    "log_diagnostic",
+    "install_hooks",
+    "init_ipc",
+]
