@@ -300,37 +300,55 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_integration_inject_child_process() {
-        // Убедимся, что hook DLL и test-target скомпилированы
-        let hook_dll = PathBuf::from("../../target/debug/state_forge_hook.dll");
-        let test_target = PathBuf::from("../../target/debug/test-target.exe");
+        use std::sync::Once;
+        static BUILD_ONCE: Once = Once::new();
 
-        let hook_dll = if hook_dll.exists() {
-            hook_dll
-        } else {
-            let alt = PathBuf::from("target/debug/state_forge_hook.dll");
-            if !alt.exists() {
-                let status = std::process::Command::new("cargo")
-                    .args(["build", "-p", "state-forge-hook", "-p", "test-target"])
-                    .status();
-                assert!(status.is_ok() && status.unwrap().success());
-            }
-            if alt.exists() { alt } else { hook_dll }
-        };
-
-        let test_target = if test_target.exists() {
-            test_target
-        } else {
-            let alt = PathBuf::from("target/debug/test-target.exe");
-            if alt.exists() { alt } else { test_target }
-        };
-
-        if !hook_dll.exists() || !test_target.exists() {
-            eprintln!(
-                "Hook DLL {:?} or test-target {:?} not found, skipping child injection test",
-                hook_dll, test_target
+        BUILD_ONCE.call_once(|| {
+            let cargo = env!("CARGO");
+            let status = std::process::Command::new(cargo)
+                .args(["build", "-p", "state-forge-hook", "-p", "test-target"])
+                .status()
+                .expect("Failed to execute cargo build for test dependencies");
+            assert!(
+                status.success(),
+                "cargo build for state-forge-hook and test-target must succeed"
             );
-            return;
+        });
+
+        let mut candidates = vec![
+            PathBuf::from("../../target/debug"),
+            PathBuf::from("target/debug"),
+        ];
+        if let Ok(cargo_manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+            candidates.push(
+                PathBuf::from(cargo_manifest)
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("target")
+                    .join("debug"),
+            );
         }
+
+        let mut hook_dll_opt = None;
+        let mut test_target_opt = None;
+
+        for base in candidates {
+            let dll = base.join("state_forge_hook.dll");
+            let exe = base.join("test-target.exe");
+            if dll.exists() && hook_dll_opt.is_none() {
+                hook_dll_opt = Some(dll);
+            }
+            if exe.exists() && test_target_opt.is_none() {
+                test_target_opt = Some(exe);
+            }
+        }
+
+        let hook_dll = hook_dll_opt
+            .expect("state_forge_hook.dll not found in target/debug! Build step must produce it.");
+        let test_target = test_target_opt
+            .expect("test-target.exe not found in target/debug! Build step must produce it.");
 
         let mut child = std::process::Command::new(&test_target)
             .stdin(std::process::Stdio::piped())

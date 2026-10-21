@@ -2,8 +2,10 @@ use once_cell::sync::Lazy;
 use state_forge_common::InterceptedEvent;
 use std::fs::{File, OpenOptions};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 static PIPE_CLIENT: Lazy<Mutex<Option<File>>> = Lazy::new(|| Mutex::new(None));
+static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 /// Подключение к Named Pipe серверу CLI
 pub fn init_ipc(pid: u32) -> Result<(), std::io::Error> {
@@ -36,9 +38,42 @@ pub fn init_ipc(pid: u32) -> Result<(), std::io::Error> {
 
 /// Отправка сериализованного события в оркестратор
 pub fn emit_event(event: InterceptedEvent) {
-    if let Ok(mut guard) = PIPE_CLIENT.lock()
-        && let Some(ref mut file) = *guard
-    {
-        let _ = state_forge_common::write_frame(file, &event);
+    let mut client_guard = match PIPE_CLIENT.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let dropped = DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+            crate::log_diagnostic(&format!(
+                "PIPE_CLIENT mutex poisoned. Total dropped events: {}",
+                dropped
+            ));
+            return;
+        }
+    };
+
+    if let Some(ref mut file) = *client_guard {
+        match state_forge_common::write_frame(file, &event) {
+            Ok(()) => {
+                let dropped = DROPPED_EVENTS.swap(0, Ordering::Relaxed);
+                if dropped > 0 {
+                    crate::log_diagnostic(&format!(
+                        "IPC pipe recovered. Note: {} events were dropped during previous errors.",
+                        dropped
+                    ));
+                }
+            }
+            Err(e) => {
+                let dropped = DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+                crate::log_diagnostic(&format!(
+                    "write_frame error: {}. Total dropped events: {}",
+                    e, dropped
+                ));
+            }
+        }
+    } else {
+        let dropped = DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::log_diagnostic(&format!(
+            "IPC pipe not connected. Total dropped events: {}",
+            dropped
+        ));
     }
 }

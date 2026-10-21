@@ -1,4 +1,5 @@
 use crate::InterceptedEvent;
+use bincode::Options;
 use std::io::{Read, Write};
 
 /// Максимальный размер одного кадра IPC (16 МБ)
@@ -10,18 +11,26 @@ pub enum FrameError {
     Io(std::io::Error),
     Bincode(bincode::Error),
     FrameTooLarge { len: usize, max: usize },
+    TrailingBytes { consumed: usize, total: usize },
 }
 
 impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrameError::Io(e) => write!(f, "I/O error: {}", e),
-            FrameError::Bincode(e) => write!(f, "Bincode deserialization error: {}", e),
+            FrameError::Bincode(e) => write!(f, "Bincode error: {}", e),
             FrameError::FrameTooLarge { len, max } => {
                 write!(
                     f,
                     "Frame length {} exceeds maximum allowed length {}",
                     len, max
+                )
+            }
+            FrameError::TrailingBytes { consumed, total } => {
+                write!(
+                    f,
+                    "Frame payload had trailing bytes (consumed {}, total {})",
+                    consumed, total
                 )
             }
         }
@@ -33,7 +42,7 @@ impl std::error::Error for FrameError {
         match self {
             FrameError::Io(e) => Some(e),
             FrameError::Bincode(e) => Some(e),
-            FrameError::FrameTooLarge { .. } => None,
+            FrameError::FrameTooLarge { .. } | FrameError::TrailingBytes { .. } => None,
         }
     }
 }
@@ -61,18 +70,23 @@ pub fn validate_frame_len(len: usize) -> Result<(), FrameError> {
     Ok(())
 }
 
-/// Запись кадра [u32 LE длина][bincode] в поток
+/// Запись кадра [u32 LE длина][bincode] в поток единым буфером
 pub fn write_frame<W: Write>(mut w: W, event: &InterceptedEvent) -> Result<(), FrameError> {
-    let encoded = bincode::serialize(event)?;
+    let encoded = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .serialize(event)?;
     validate_frame_len(encoded.len())?;
-    let len = (encoded.len() as u32).to_le_bytes();
-    w.write_all(&len)?;
-    w.write_all(&encoded)?;
+
+    let mut frame_buf = Vec::with_capacity(4 + encoded.len());
+    frame_buf.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    frame_buf.extend_from_slice(&encoded);
+
+    w.write_all(&frame_buf)?;
     w.flush()?;
     Ok(())
 }
 
-/// Чтение кадра [u32 LE длина][bincode] из потока
+/// Чтение кадра [u32 LE длина][bincode] из потока с валидацией отсутствия лишних байтов в payload
 pub fn read_frame<R: Read>(mut r: R) -> Result<Option<InterceptedEvent>, FrameError> {
     let mut len_buf = [0u8; 4];
     let mut read_bytes = 0;
@@ -103,7 +117,19 @@ pub fn read_frame<R: Read>(mut r: R) -> Result<Option<InterceptedEvent>, FrameEr
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)?;
 
-    let event = bincode::deserialize(&payload)?;
+    let mut cursor = std::io::Cursor::new(&payload);
+    let event: InterceptedEvent = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .deserialize_from(&mut cursor)?;
+
+    let consumed = cursor.position() as usize;
+    if consumed < payload.len() {
+        return Err(FrameError::TrailingBytes {
+            consumed,
+            total: payload.len(),
+        });
+    }
+
     Ok(Some(event))
 }
 
@@ -113,11 +139,25 @@ mod tests {
     use crate::{NetworkDirection, NetworkEventPayload};
     use std::io::Cursor;
 
+    struct ByteByByteReader<R> {
+        inner: R,
+    }
+
+    impl<R: Read> Read for ByteByByteReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            self.inner.read(&mut buf[..1])
+        }
+    }
+
     #[test]
     fn test_roundtrip_all_event_types() {
         let events = vec![
             InterceptedEvent {
                 pid: 100,
+                seq: 1,
                 timestamp_millis: 1000,
                 payload: NetworkEventPayload::Connect {
                     socket: 1,
@@ -127,6 +167,7 @@ mod tests {
             },
             InterceptedEvent {
                 pid: 101,
+                seq: 2,
                 timestamp_millis: 1001,
                 payload: NetworkEventPayload::Connect {
                     socket: 2,
@@ -136,6 +177,7 @@ mod tests {
             },
             InterceptedEvent {
                 pid: 102,
+                seq: 3,
                 timestamp_millis: 1002,
                 payload: NetworkEventPayload::Connect {
                     socket: 3,
@@ -145,35 +187,48 @@ mod tests {
             },
             InterceptedEvent {
                 pid: 103,
+                seq: 4,
                 timestamp_millis: 1003,
                 payload: NetworkEventPayload::Data {
                     socket: 4,
                     direction: NetworkDirection::Tx,
+                    original_len: 8,
                     bytes: b"Hello Tx".to_vec(),
                 },
             },
             InterceptedEvent {
                 pid: 104,
+                seq: 5,
                 timestamp_millis: 1004,
                 payload: NetworkEventPayload::Data {
                     socket: 5,
                     direction: NetworkDirection::Rx,
+                    original_len: 8,
                     bytes: b"Hello Rx".to_vec(),
                 },
             },
             InterceptedEvent {
                 pid: 105,
+                seq: 6,
                 timestamp_millis: 1005,
                 payload: NetworkEventPayload::Data {
                     socket: 6,
                     direction: NetworkDirection::Tx,
+                    original_len: 0,
                     bytes: vec![],
                 },
             },
             InterceptedEvent {
                 pid: 106,
+                seq: 7,
                 timestamp_millis: 1006,
                 payload: NetworkEventPayload::Close { socket: 7 },
+            },
+            InterceptedEvent {
+                pid: 107,
+                seq: 8,
+                timestamp_millis: 1007,
+                payload: NetworkEventPayload::PeerClosed { socket: 8 },
             },
         ];
 
@@ -186,55 +241,126 @@ mod tests {
                 .expect("Failed to read frame")
                 .expect("Expected event, got EOF");
 
-            assert_eq!(read_ev.pid, ev.pid);
-            assert_eq!(read_ev.timestamp_millis, ev.timestamp_millis);
-            match (&read_ev.payload, &ev.payload) {
-                (
-                    NetworkEventPayload::Connect {
-                        socket: s1,
-                        remote_addr: r1,
-                        success: sc1,
-                    },
-                    NetworkEventPayload::Connect {
-                        socket: s2,
-                        remote_addr: r2,
-                        success: sc2,
-                    },
-                ) => {
-                    assert_eq!(s1, s2);
-                    assert_eq!(r1, r2);
-                    assert_eq!(sc1, sc2);
-                }
-                (
-                    NetworkEventPayload::Data {
-                        socket: s1,
-                        direction: d1,
-                        bytes: b1,
-                    },
-                    NetworkEventPayload::Data {
-                        socket: s2,
-                        direction: d2,
-                        bytes: b2,
-                    },
-                ) => {
-                    assert_eq!(s1, s2);
-                    assert_eq!(d1, d2);
-                    assert_eq!(b1, b2);
-                }
-                (
-                    NetworkEventPayload::Close { socket: s1 },
-                    NetworkEventPayload::Close { socket: s2 },
-                ) => {
-                    assert_eq!(s1, s2);
-                }
-                _ => panic!("Payload variant mismatch"),
-            }
+            assert_eq!(read_ev, *ev);
         }
     }
 
     #[test]
+    fn test_wire_format_exact_bytes() {
+        let event = InterceptedEvent {
+            pid: 1,
+            seq: 3,
+            timestamp_millis: 2,
+            payload: NetworkEventPayload::Close { socket: 7 },
+        };
+
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &event).expect("write_frame failed");
+
+        let expected_bytes: Vec<u8> = vec![
+            // Header (4 bytes): length of payload = 32 (0x00000020) LE
+            0x20, 0x00, 0x00, 0x00, // Payload (32 bytes):
+            // pid: u32 = 1
+            0x01, 0x00, 0x00, 0x00, // seq: u64 = 3
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // timestamp_millis: u64 = 2
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // discriminant: Close = 2 (u32 LE)
+            0x02, 0x00, 0x00, 0x00, // socket: u64 = 7
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        assert_eq!(buf.len(), 36);
+        assert_eq!(buf, expected_bytes);
+    }
+
+    #[test]
+    fn test_write_frame_exceeds_max_len_writes_nothing() {
+        let event = InterceptedEvent {
+            pid: 1,
+            seq: 1,
+            timestamp_millis: 1,
+            payload: NetworkEventPayload::Data {
+                socket: 1,
+                direction: NetworkDirection::Tx,
+                original_len: (MAX_FRAME_LEN + 1) as u32,
+                bytes: vec![0u8; MAX_FRAME_LEN + 1],
+            },
+        };
+
+        let mut buf = Vec::new();
+        let res = write_frame(&mut buf, &event);
+        assert!(matches!(res, Err(FrameError::FrameTooLarge { .. })));
+        assert!(buf.is_empty(), "Expected nothing to be written on error");
+    }
+
+    #[test]
+    fn test_read_frame_byte_by_byte_reader() {
+        let event = InterceptedEvent {
+            pid: 42,
+            seq: 100,
+            timestamp_millis: 500,
+            payload: NetworkEventPayload::Close { socket: 10 },
+        };
+
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &event).unwrap();
+
+        let reader = ByteByByteReader {
+            inner: Cursor::new(buf),
+        };
+        let decoded = read_frame(reader).unwrap().expect("event");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn test_read_frame_trailing_bytes_error() {
+        let event = InterceptedEvent {
+            pid: 1,
+            seq: 2,
+            timestamp_millis: 3,
+            payload: NetworkEventPayload::Close { socket: 4 },
+        };
+
+        let mut valid_payload = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .serialize(&event)
+            .unwrap();
+        valid_payload.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        let mut frame_buf = Vec::new();
+        frame_buf.extend_from_slice(&(valid_payload.len() as u32).to_le_bytes());
+        frame_buf.extend_from_slice(&valid_payload);
+
+        let mut cursor = Cursor::new(frame_buf);
+        let err = read_frame(&mut cursor).unwrap_err();
+        match err {
+            FrameError::TrailingBytes { consumed, total } => {
+                assert_eq!(total, valid_payload.len());
+                assert_eq!(consumed, valid_payload.len() - 4);
+            }
+            _ => panic!("Expected TrailingBytes error, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_peer_closed_roundtrip() {
+        let event = InterceptedEvent {
+            pid: 111,
+            seq: 222,
+            timestamp_millis: 333,
+            payload: NetworkEventPayload::PeerClosed { socket: 444 },
+        };
+
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &event).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded = read_frame(&mut cursor).unwrap().expect("event");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
     fn test_truncated_header() {
-        // Only 2 bytes instead of 4
         let buf = [0x01u8, 0x02];
         let mut cursor = Cursor::new(&buf);
         let err = read_frame(&mut cursor).unwrap_err();
@@ -248,7 +374,6 @@ mod tests {
 
     #[test]
     fn test_truncated_payload() {
-        // Header says length is 10, but only 3 bytes of payload provided
         let mut buf = Vec::new();
         buf.extend_from_slice(&(10u32).to_le_bytes());
         buf.extend_from_slice(&[1, 2, 3]);
@@ -280,7 +405,6 @@ mod tests {
 
     #[test]
     fn test_garbage_payload_with_valid_length() {
-        // Valid length, but corrupted bincode payload
         let garbage = [0xFFu8; 16];
         let mut buf = Vec::new();
         buf.extend_from_slice(&(garbage.len() as u32).to_le_bytes());
@@ -298,16 +422,19 @@ mod tests {
     fn test_multiple_consecutive_frames_in_one_buffer() {
         let ev1 = InterceptedEvent {
             pid: 1,
+            seq: 10,
             timestamp_millis: 10,
             payload: NetworkEventPayload::Close { socket: 11 },
         };
         let ev2 = InterceptedEvent {
             pid: 2,
+            seq: 20,
             timestamp_millis: 20,
             payload: NetworkEventPayload::Close { socket: 22 },
         };
         let ev3 = InterceptedEvent {
             pid: 3,
+            seq: 30,
             timestamp_millis: 30,
             payload: NetworkEventPayload::Close { socket: 33 },
         };
@@ -319,13 +446,13 @@ mod tests {
 
         let mut cursor = Cursor::new(stream);
         let r1 = read_frame(&mut cursor).unwrap().expect("ev1");
-        assert_eq!(r1.pid, 1);
+        assert_eq!(r1, ev1);
 
         let r2 = read_frame(&mut cursor).unwrap().expect("ev2");
-        assert_eq!(r2.pid, 2);
+        assert_eq!(r2, ev2);
 
         let r3 = read_frame(&mut cursor).unwrap().expect("ev3");
-        assert_eq!(r3.pid, 3);
+        assert_eq!(r3, ev3);
 
         let eof = read_frame(&mut cursor).unwrap();
         assert!(eof.is_none());

@@ -1,3 +1,4 @@
+use bincode::Options;
 use state_forge_common::{InterceptedEvent, NetworkDirection, NetworkEventPayload};
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
@@ -66,7 +67,19 @@ pub async fn read_frame_async<R: AsyncReadExt + Unpin>(
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload).await?;
 
-    let event = bincode::deserialize::<InterceptedEvent>(&payload)?;
+    let mut cursor = std::io::Cursor::new(&payload);
+    let event: InterceptedEvent = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .deserialize_from(&mut cursor)?;
+
+    let consumed = cursor.position() as usize;
+    if consumed < payload.len() {
+        return Err(Box::new(state_forge_common::FrameError::TrailingBytes {
+            consumed,
+            total: payload.len(),
+        }));
+    }
+
     Ok(Some(event))
 }
 
@@ -190,10 +203,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     success,
                 } => {
                     let log_line = format!(
-                        "[{}] CONNECT socket={} remote={:?} success={}",
-                        event.timestamp_millis, socket, remote_addr, success
+                        "[{}] seq={} CONNECT socket={} remote={:?} success={}",
+                        event.timestamp_millis, event.seq, socket, remote_addr, success
                     );
                     info!(
+                        seq = event.seq,
                         socket = socket,
                         remote = ?remote_addr,
                         success = success,
@@ -207,6 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 NetworkEventPayload::Data {
                     socket,
                     direction,
+                    original_len,
                     bytes,
                 } => {
                     let dir_str = match direction {
@@ -216,16 +231,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let dump = format_hex_dump(bytes, 48);
 
                     let log_line = format!(
-                        "[{}] DATA socket={} dir={} bytes={} dump={}",
+                        "[{}] seq={} DATA socket={} dir={} orig_len={} bytes={} dump={}",
                         event.timestamp_millis,
+                        event.seq,
                         socket,
                         dir_str,
+                        original_len,
                         bytes.len(),
                         dump
                     );
                     info!(
+                        seq = event.seq,
                         socket = socket,
                         dir = dir_str,
+                        orig_len = original_len,
                         bytes = bytes.len(),
                         dump = %dump,
                         "📦 [PACKET]"
@@ -236,8 +255,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 NetworkEventPayload::Close { socket } => {
-                    let log_line = format!("[{}] CLOSE socket={}", event.timestamp_millis, socket);
-                    info!(socket = socket, "🔌 [CLOSE] Сокет закрыт");
+                    let log_line = format!(
+                        "[{}] seq={} CLOSE socket={}",
+                        event.timestamp_millis, event.seq, socket
+                    );
+                    info!(seq = event.seq, socket = socket, "🔌 [CLOSE] Сокет закрыт");
+                    if let Some(ref mut tfile) = text_log_file {
+                        let _ = writeln!(tfile, "{}", log_line);
+                        let _ = tfile.flush();
+                    }
+                }
+                NetworkEventPayload::PeerClosed { socket } => {
+                    let log_line = format!(
+                        "[{}] seq={} PEER_CLOSED socket={}",
+                        event.timestamp_millis, event.seq, socket
+                    );
+                    info!(
+                        seq = event.seq,
+                        socket = socket,
+                        "🚪 [PEER_CLOSED] Соединение закрыто удалённым пиром"
+                    );
                     if let Some(ref mut tfile) = text_log_file {
                         let _ = writeln!(tfile, "{}", log_line);
                         let _ = tfile.flush();
@@ -326,6 +363,7 @@ mod tests {
     async fn test_read_frame_async_roundtrip() {
         let event = InterceptedEvent {
             pid: 777,
+            seq: 1,
             timestamp_millis: 123456,
             payload: NetworkEventPayload::Close { socket: 99 },
         };
@@ -336,12 +374,31 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         let read = read_frame_async(&mut cursor).await.unwrap().expect("event");
 
-        assert_eq!(read.pid, 777);
-        assert_eq!(read.timestamp_millis, 123456);
-        match read.payload {
-            NetworkEventPayload::Close { socket } => assert_eq!(socket, 99),
-            _ => panic!("Expected Close payload"),
-        }
+        assert_eq!(read, event);
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_async_trailing_bytes() {
+        let event = InterceptedEvent {
+            pid: 777,
+            seq: 2,
+            timestamp_millis: 123456,
+            payload: NetworkEventPayload::Close { socket: 99 },
+        };
+
+        let mut payload = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .serialize(&event)
+            .unwrap();
+        payload.extend_from_slice(&[1, 2, 3]);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&payload);
+
+        let mut cursor = Cursor::new(buf);
+        let res = read_frame_async(&mut cursor).await;
+        assert!(res.is_err());
     }
 
     #[tokio::test]
