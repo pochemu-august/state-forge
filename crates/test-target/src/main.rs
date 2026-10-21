@@ -25,8 +25,15 @@ fn start_local_echo_server() -> u16 {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let wait_stdin = args.iter().any(|arg| arg == "--wait-stdin") || args.len() <= 1;
+
     let pid = std::process::id();
     let local_port = start_local_echo_server();
+
+    let _ = std::io::stdout().flush();
+    println!("PID: {}", pid);
+    let _ = std::io::stdout().flush();
 
     println!("══════════════════════════════════════════════════════════");
     println!("  Test Target Process (Winsock traffic generator)");
@@ -37,10 +44,13 @@ fn main() {
     println!("  или:");
     println!("    .\\analyze.bat run {}", pid);
     println!("══════════════════════════════════════════════════════════");
-    println!("Нажмите ENTER после подключения перехватчика для отправки сетевых пакетов...");
 
-    let mut line = String::new();
-    let _ = std::io::stdin().read_line(&mut line);
+    if wait_stdin {
+        println!("Нажмите ENTER после подключения перехватчика для отправки сетевых пакетов...");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
 
     println!(
         "[*] Подключение к локальному серверу 127.0.0.1:{}...",

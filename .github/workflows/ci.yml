@@ -35,8 +35,8 @@ jobs:
       - name: Workspace compilation check
         run: cargo check --workspace --all-targets
 
+      - name: Build workspace
+        run: cargo build --workspace --verbose
+
       - name: Run unit & integration tests
         run: cargo test --workspace --verbose
-
-      - name: Build all targets
-        run: cargo build --workspace --verbose

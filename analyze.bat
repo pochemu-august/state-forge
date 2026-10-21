@@ -91,6 +91,12 @@ if "%PID_ARG%"=="" (
     exit /b 1
 )
 
+echo %PID_ARG%| findstr /r "^[0-9][0-9]*$" >nul
+if %ERRORLEVEL% neq 0 (
+    echo [!] Error: PID must contain only digits. Got: "%PID_ARG%"
+    exit /b 1
+)
+
 echo.
 echo [*] Launching state-forge-cli for PID %PID_ARG%...
 cargo run -p state-forge-cli -- %PID_ARG%
@@ -103,12 +109,14 @@ if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 set "FMT_LOG=%LOG_DIR%\fmt.log"
 set "CLIPPY_LOG=%LOG_DIR%\clippy.log"
 set "CHECK_LOG=%LOG_DIR%\check.log"
+set "BUILD_LOG=%LOG_DIR%\build.log"
 set "TEST_LOG=%LOG_DIR%\test.log"
 
 set "ERRORS=0"
 set "STATUS_FMT=[PASS]"
 set "STATUS_CLIPPY=[PASS]"
 set "STATUS_CHECK=[PASS]"
+set "STATUS_BUILD=[PASS]"
 set "STATUS_TEST=[PASS]"
 
 echo.
@@ -117,7 +125,7 @@ echo   state-forge: Rust Code Analysis and Verification
 echo ====================================================================
 echo.
 
-echo [1/4] Checking code style (cargo fmt)...
+echo [1/5] Checking code style (cargo fmt)...
 echo === Cargo Fmt Style Check [%DATE% %TIME%] === > "%FMT_LOG%"
 cargo fmt --all -- --check >> "%FMT_LOG%" 2>&1
 if !ERRORLEVEL! equ 0 (
@@ -127,9 +135,9 @@ if !ERRORLEVEL! equ 0 (
     set /a ERRORS+=1
 )
 
-echo [2/4] Checking code logic and idioms (cargo clippy)...
+echo [2/5] Checking code logic and idioms (cargo clippy)...
 echo === Cargo Clippy Linter Analysis [%DATE% %TIME%] === > "%CLIPPY_LOG%"
-cargo clippy --workspace --all-targets --all-features >> "%CLIPPY_LOG%" 2>&1
+cargo clippy --workspace --all-targets --all-features -- -D warnings >> "%CLIPPY_LOG%" 2>&1
 if !ERRORLEVEL! equ 0 (
     echo [OK] 0 warnings and 0 anti-patterns detected. Clean codebase. >> "%CLIPPY_LOG%"
 ) else (
@@ -137,7 +145,7 @@ if !ERRORLEVEL! equ 0 (
     set /a ERRORS+=1
 )
 
-echo [3/4] Checking workspace compilation (cargo check)...
+echo [3/5] Checking workspace compilation (cargo check)...
 echo === Cargo Workspace Compilation Check [%DATE% %TIME%] === > "%CHECK_LOG%"
 cargo check --workspace --all-targets >> "%CHECK_LOG%" 2>&1
 if !ERRORLEVEL! equ 0 (
@@ -147,7 +155,17 @@ if !ERRORLEVEL! equ 0 (
     set /a ERRORS+=1
 )
 
-echo [4/4] Running unit and integration tests (cargo test)...
+echo [4/5] Building workspace binaries and libraries (cargo build)...
+echo === Cargo Workspace Build [%DATE% %TIME%] === > "%BUILD_LOG%"
+cargo build --workspace >> "%BUILD_LOG%" 2>&1
+if !ERRORLEVEL! equ 0 (
+    echo [OK] All workspace targets built successfully. >> "%BUILD_LOG%"
+) else (
+    set "STATUS_BUILD=[FAIL]"
+    set /a ERRORS+=1
+)
+
+echo [5/5] Running unit and integration tests (cargo test)...
 echo === Cargo Unit and Integration Tests [%DATE% %TIME%] === > "%TEST_LOG%"
 cargo test --workspace >> "%TEST_LOG%" 2>&1
 if !ERRORLEVEL! equ 0 (
@@ -164,7 +182,8 @@ echo ====================================================================
 echo  1. Code Style (rustfmt)       : !STATUS_FMT!   - Log: %FMT_LOG%
 echo  2. Code Logic (clippy)        : !STATUS_CLIPPY!   - Log: %CLIPPY_LOG%
 echo  3. Compilation (cargo check)  : !STATUS_CHECK!   - Log: %CHECK_LOG%
-echo  4. Tests Suite (cargo test)   : !STATUS_TEST!   - Log: %TEST_LOG%
+echo  4. Workspace Build (build)    : !STATUS_BUILD!   - Log: %BUILD_LOG%
+echo  5. Tests Suite (cargo test)   : !STATUS_TEST!   - Log: %TEST_LOG%
 echo ====================================================================
 
 if !ERRORS! equ 0 goto :ALL_PASSED

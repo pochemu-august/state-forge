@@ -83,18 +83,65 @@ analyze.bat clean run <PID>
 
 ---
 
+## IPC Протокол и Формат Событий
+
+### Именование файлов логов
+Логи перехваченного сетевого трафика сохраняются в директории `logs/`:
+- Текстовый лог: `logs/traffic_<PID>_<timestamp>.log`
+- Машиночитаемый лог: `logs/traffic_<PID>_<timestamp>.jsonl`
+
+### Формат кадра IPC
+Каждое событие отправляется через Windows Named Pipe `\\.\pipe\state_forge_<PID>` единым буфером в бинарном формате:
+```text
+┌───────────────────────┬────────────────────────────────────────────┐
+│ 4 байта (u32 LE)      │ N байт (Bincode payload)                   │
+│ Длина payload (макс.  │ Сериализованная структура InterceptedEvent │
+│ 16 МБ)                │                                            │
+└───────────────────────┴────────────────────────────────────────────┘
+```
+
+Поля события `InterceptedEvent`:
+- `pid: u32` — идентификатор процесса
+- `seq: u64` — строго монотонно возрастающий порядковый номер события в процессе
+- `timestamp_millis: u64` — метка времени события (UNIX epoch milliseconds)
+- `payload: NetworkEventPayload` — тип сетевого события:
+  - `Connect { socket: u64, remote_addr: Option<SocketAddr>, success: bool }`
+  - `Data { socket: u64, direction: NetworkDirection, original_len: u32, bytes: Vec<u8> }`
+    - `original_len: u32` — исходная длина перехваченного сетевого буфера до возможного усечения лимитом захвата `MAX_CAPTURE_BYTES` (1 МБ)
+  - `Close { socket: u64 }`
+  - `PeerClosed { socket: u64 }` — завершение соединения удаленным пиром (эмитируется только для сокетов `SOCK_STREAM` при `ret == 0` и `len > 0`)
+
+### Перехватываемые функции Winsock (ws2_32.dll)
+- **Хукаемые функции:**
+  - `connect`
+  - `send`
+  - `recv`
+  - `closesocket`
+- **НЕ хукаемые функции (явный перечень):**
+  - `WSASend`
+  - `WSARecv`
+  - `WSAConnect`
+  - `ConnectEx`
+  - `AcceptEx`
+  - `accept`
+  - `sendto`
+  - `recvfrom`
+
+---
+
 ## Проверка и аудит качества кода
 
-Скрипт [`analyze.bat`](analyze.bat) выполняет автоматический анализ форматирования, линтинг, компиляцию целей и тесты, сохраняя детальные отчеты в `logs/`:
+Скрипт [`analyze.bat`](analyze.bat) выполняет автоматический анализ форматирования, линтинг, компиляцию целей, сборку воркспейса и тесты, сохраняя детальные отчеты в `logs/`:
 ```cmd
 analyze.bat
 ```
 
 Проверяемые этапы:
 1. **Стиль кода**: `cargo fmt --all -- --check` $\rightarrow$ `logs\fmt.log`
-2. **Логика и качество**: `cargo clippy --workspace --all-targets --all-features` $\rightarrow$ `logs\clippy.log`
+2. **Логика и качество**: `cargo clippy --workspace --all-targets --all-features -- -D warnings` $\rightarrow$ `logs\clippy.log`
 3. **Проверка компиляции**: `cargo check --workspace --all-targets` $\rightarrow$ `logs\check.log`
-4. **Тесты**: `cargo test --workspace` $\rightarrow$ `logs\test.log`
+4. **Сборка воркспейса**: `cargo build --workspace` $\rightarrow$ `logs\build.log`
+5. **Тесты**: `cargo test --workspace` $\rightarrow$ `logs\test.log`
 
 ---
 

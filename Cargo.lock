@@ -347,6 +347,8 @@ dependencies = [
 name = "state-forge-injector"
 version = "0.1.0"
 dependencies = [
+ "state-forge-common",
+ "tokio",
  "windows-sys 0.59.0",
 ]
 

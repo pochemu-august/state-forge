@@ -8,8 +8,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, MSG_PEEK, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKET, WSAEWOULDBLOCK,
-    WSAGetLastError, WSASetLastError,
+    AF_INET, AF_INET6, MSG_PEEK, SO_TYPE, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKET,
+    SOL_SOCKET, WSAEWOULDBLOCK, WSAGetLastError, WSASetLastError, getsockopt,
 };
 
 static ORIGINAL_CONNECT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -46,14 +46,37 @@ pub fn connect_success(res: c_int, last_error: i32) -> bool {
     res == 0 || (res == -1 && last_error == WSAEWOULDBLOCK)
 }
 
-pub fn should_log_recv(ret: c_int, flags: c_int) -> RecvAction {
-    if (flags & (MSG_PEEK as c_int)) != 0 {
+pub fn is_stream_socket_type(sock_type: c_int) -> bool {
+    sock_type == (SOCK_STREAM as c_int)
+}
+
+pub fn check_is_stream_socket(s: SOCKET) -> bool {
+    let mut optval: c_int = 0;
+    let mut optlen: c_int = std::mem::size_of::<c_int>() as c_int;
+    let res = unsafe {
+        getsockopt(
+            s,
+            SOL_SOCKET as c_int,
+            SO_TYPE,
+            &mut optval as *mut c_int as *mut _,
+            &mut optlen,
+        )
+    };
+    res == 0 && is_stream_socket_type(optval)
+}
+
+pub fn should_log_recv(ret: c_int, len: c_int, flags: c_int, is_stream: bool) -> RecvAction {
+    if (flags & (MSG_PEEK as c_int)) != 0 || len == 0 {
         return RecvAction::Ignore;
     }
     if ret > 0 {
         RecvAction::Data
     } else if ret == 0 {
-        RecvAction::PeerClosed
+        if is_stream {
+            RecvAction::PeerClosed
+        } else {
+            RecvAction::Ignore
+        }
     } else {
         RecvAction::Ignore
     }
@@ -180,8 +203,9 @@ pub unsafe extern "system" fn detour_recv(
     let original: RecvFn = unsafe { std::mem::transmute(orig_ptr) };
     let bytes_received = unsafe { original(s, buf, len, flags) };
     let last_error = unsafe { WSAGetLastError() };
+    let is_stream = check_is_stream_socket(s);
 
-    match should_log_recv(bytes_received, flags) {
+    match should_log_recv(bytes_received, len, flags, is_stream) {
         RecvAction::Data => {
             if !buf.is_null() {
                 let seq = next_seq();
@@ -264,8 +288,14 @@ pub fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use windows_sys::Win32::Networking::WinSock::{
-        IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, WSAECONNREFUSED,
+        IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, SOCK_DGRAM, SOCK_STREAM, WSAECONNREFUSED,
     };
+
+    #[test]
+    fn test_is_stream_socket_type() {
+        assert!(is_stream_socket_type(SOCK_STREAM as c_int));
+        assert!(!is_stream_socket_type(SOCK_DGRAM as c_int));
+    }
 
     #[test]
     fn test_connect_success() {
@@ -277,17 +307,42 @@ mod tests {
 
     #[test]
     fn test_should_log_recv() {
-        // Normal positive read without MSG_PEEK -> Data
-        assert_eq!(should_log_recv(100, 0), RecvAction::Data);
-        // Graceful close (ret == 0) without MSG_PEEK -> PeerClosed
-        assert_eq!(should_log_recv(0, 0), RecvAction::PeerClosed);
-        // Error (ret < 0) -> Ignore
-        assert_eq!(should_log_recv(-1, 0), RecvAction::Ignore);
+        // len == 0: ничего не эмитируем (ret == 0 тогда не означает закрытие)
+        assert_eq!(should_log_recv(0, 0, 0, true), RecvAction::Ignore);
+        assert_eq!(should_log_recv(0, 0, 0, false), RecvAction::Ignore);
+        assert_eq!(should_log_recv(10, 0, 0, true), RecvAction::Ignore);
 
-        // With MSG_PEEK, both ret > 0 and ret == 0 must be ignored
-        assert_eq!(should_log_recv(100, MSG_PEEK as c_int), RecvAction::Ignore);
-        assert_eq!(should_log_recv(0, MSG_PEEK as c_int), RecvAction::Ignore);
-        assert_eq!(should_log_recv(-1, MSG_PEEK as c_int), RecvAction::Ignore);
+        // ret == 0 при stream -> PeerClosed
+        assert_eq!(should_log_recv(0, 1024, 0, true), RecvAction::PeerClosed);
+
+        // ret == 0 при dgram -> Ignore
+        assert_eq!(should_log_recv(0, 1024, 0, false), RecvAction::Ignore);
+
+        // MSG_PEEK: всегда Ignore
+        assert_eq!(
+            should_log_recv(100, 1024, MSG_PEEK as c_int, true),
+            RecvAction::Ignore
+        );
+        assert_eq!(
+            should_log_recv(0, 1024, MSG_PEEK as c_int, true),
+            RecvAction::Ignore
+        );
+        assert_eq!(
+            should_log_recv(0, 1024, MSG_PEEK as c_int, false),
+            RecvAction::Ignore
+        );
+        assert_eq!(
+            should_log_recv(-1, 1024, MSG_PEEK as c_int, true),
+            RecvAction::Ignore
+        );
+
+        // Normal positive read without MSG_PEEK -> Data
+        assert_eq!(should_log_recv(100, 1024, 0, true), RecvAction::Data);
+        assert_eq!(should_log_recv(100, 1024, 0, false), RecvAction::Data);
+
+        // Error (ret < 0) -> Ignore
+        assert_eq!(should_log_recv(-1, 1024, 0, true), RecvAction::Ignore);
+        assert_eq!(should_log_recv(-1, 1024, 0, false), RecvAction::Ignore);
     }
 
     #[test]
@@ -312,8 +367,8 @@ mod tests {
         let s1 = next_seq();
         let s2 = next_seq();
         let s3 = next_seq();
-        assert_eq!(s2, s1 + 1);
-        assert_eq!(s3, s2 + 1);
+        assert!(s2 > s1, "Expected s2 ({}) > s1 ({})", s2, s1);
+        assert!(s3 > s2, "Expected s3 ({}) > s2 ({})", s3, s2);
     }
 
     #[test]

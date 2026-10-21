@@ -300,10 +300,23 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_integration_inject_child_process() {
-        use std::sync::Once;
-        static BUILD_ONCE: Once = Once::new();
+        use state_forge_common::{InterceptedEvent, NetworkDirection, NetworkEventPayload};
+        use std::ffi::OsStr;
+        use std::io::Write;
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        use std::path::PathBuf;
+        use std::sync::OnceLock;
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+        };
+        const PIPE_ACCESS_INBOUND: u32 = 1;
 
-        BUILD_ONCE.call_once(|| {
+        static BUILD_ONCE: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+
+        let (hook_dll, test_target) = BUILD_ONCE.get_or_init(|| {
             let cargo = env!("CARGO");
             let status = std::process::Command::new(cargo)
                 .args(["build", "-p", "state-forge-hook", "-p", "test-target"])
@@ -311,62 +324,283 @@ mod tests {
                 .expect("Failed to execute cargo build for test dependencies");
             assert!(
                 status.success(),
-                "cargo build for state-forge-hook and test-target must succeed"
+                "cargo build for state-forge-hook and test-target must succeed, exit status: {:?}",
+                status
             );
+
+            let mut candidates = vec![
+                PathBuf::from("../../target/debug"),
+                PathBuf::from("target/debug"),
+            ];
+            if let Ok(cargo_manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+                candidates.push(
+                    PathBuf::from(cargo_manifest)
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .join("target")
+                        .join("debug"),
+                );
+            }
+
+            let mut hook_dll_opt = None;
+            let mut test_target_opt = None;
+
+            for base in candidates {
+                let dll = base.join("state_forge_hook.dll");
+                let exe = base.join("test-target.exe");
+                if dll.exists() && hook_dll_opt.is_none() {
+                    hook_dll_opt = Some(dll);
+                }
+                if exe.exists() && test_target_opt.is_none() {
+                    test_target_opt = Some(exe);
+                }
+            }
+
+            let hook_dll = hook_dll_opt.expect(
+                "state_forge_hook.dll not found in target/debug! Build step must produce it.",
+            );
+            let test_target = test_target_opt
+                .expect("test-target.exe not found in target/debug! Build step must produce it.");
+
+            (hook_dll, test_target)
         });
 
-        let mut candidates = vec![
-            PathBuf::from("../../target/debug"),
-            PathBuf::from("target/debug"),
-        ];
-        if let Ok(cargo_manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-            candidates.push(
-                PathBuf::from(cargo_manifest)
-                    .parent()
-                    .unwrap()
-                    .parent()
-                    .unwrap()
-                    .join("target")
-                    .join("debug"),
-            );
-        }
-
-        let mut hook_dll_opt = None;
-        let mut test_target_opt = None;
-
-        for base in candidates {
-            let dll = base.join("state_forge_hook.dll");
-            let exe = base.join("test-target.exe");
-            if dll.exists() && hook_dll_opt.is_none() {
-                hook_dll_opt = Some(dll);
-            }
-            if exe.exists() && test_target_opt.is_none() {
-                test_target_opt = Some(exe);
+        // Guard с Drop убивает дочерний процесс при любом исходе теста
+        struct ChildGuard(Option<std::process::Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
             }
         }
 
-        let hook_dll = hook_dll_opt
-            .expect("state_forge_hook.dll not found in target/debug! Build step must produce it.");
-        let test_target = test_target_opt
-            .expect("test-target.exe not found in target/debug! Build step must produce it.");
-
-        let mut child = std::process::Command::new(&test_target)
+        let mut child = std::process::Command::new(test_target)
+            .arg("--wait-stdin")
             .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("Failed to spawn test-target child process");
 
         let pid = child.id();
-        let inject_res = inject_dll(pid, &hook_dll);
+        let mut stdin = child.stdin.take().expect("Child stdin must be piped");
+        let guard = ChildGuard(Some(child));
 
-        let _ = child.kill();
-        let _ = child.wait();
+        // c) Создаем Named Pipe сервер \\.\pipe\state_forge_<PID> ДО инъекции
+        let pipe_name = format!(r"\\.\pipe\state_forge_{}", pid);
+        let wide_pipe_name: Vec<u16> = OsStr::new(&pipe_name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
 
+        let pipe_handle = unsafe {
+            CreateNamedPipeW(
+                wide_pipe_name.as_ptr(),
+                PIPE_ACCESS_INBOUND,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                65536,
+                65536,
+                10000,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(
+            pipe_handle,
+            INVALID_HANDLE_VALUE,
+            "CreateNamedPipeW failed with Win32 error {}",
+            unsafe { GetLastError() }
+        );
+
+        // e) Читаем кадры через read_frame в отдельном потоке
+        let (tx, rx) = std::sync::mpsc::channel::<InterceptedEvent>();
+        let (connected_tx, connected_rx) = std::sync::mpsc::channel::<()>();
+        let pipe_raw = pipe_handle as isize;
+        let reader_thread = std::thread::spawn(move || {
+            let handle = pipe_raw as windows_sys::Win32::Foundation::HANDLE;
+            let res = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
+            let err = unsafe { GetLastError() };
+            // res != 0 means success; res == 0 with err == 535 (ERROR_PIPE_CONNECTED) means already connected
+            if res == 0 && err != 535 {
+                return;
+            }
+            let _ = connected_tx.send(());
+            let mut file = unsafe { std::fs::File::from_raw_handle(handle as _) };
+            loop {
+                match state_forge_common::read_frame(&mut file) {
+                    Ok(Some(event)) => {
+                        if tx.send(event).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // d) inject_dll, затем отправляем в stdin перевод строки
+        let inject_res = inject_dll(pid, hook_dll);
         assert!(
             inject_res.is_ok(),
             "Expected successful DLL injection into child process, got: {:?}",
             inject_res
         );
+
+        // Дожидаемся подключения IPC от внедренной DLL
+        let _ = connected_rx.recv_timeout(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(100));
+
+        stdin
+            .write_all(b"\n")
+            .expect("Failed to write newline to test-target stdin");
+        stdin.flush().expect("Failed to flush test-target stdin");
+
+        // e) Читаем кадры до таймаута 10 с или пока не увидишь Close для клиентского сокета
+        let timeout = Duration::from_secs(10);
+        let start = Instant::now();
+        let mut events: Vec<InterceptedEvent> = Vec::new();
+        let mut client_socket: Option<u64> = None;
+
+        while start.elapsed() < timeout {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => {
+                    if let NetworkEventPayload::Connect {
+                        socket,
+                        success: true,
+                        ..
+                    } = event.payload
+                        && client_socket.is_none()
+                    {
+                        client_socket = Some(socket);
+                    }
+
+                    let is_client_close = match &event.payload {
+                        NetworkEventPayload::Close { socket } => Some(*socket) == client_socket,
+                        _ => false,
+                    };
+
+                    events.push(event);
+
+                    if is_client_close {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        // Завершаем дочерний процесс через guard
+        drop(guard);
+        let _ = reader_thread.join();
+
+        // f) Ассерты:
+        // 1. Минимум одно Connect с remote_addr 127.0.0.1 и success=true
+        let connect_event = events.iter().find(|e| {
+            if let NetworkEventPayload::Connect {
+                remote_addr: Some(addr),
+                success,
+                ..
+            } = &e.payload
+            {
+                *success && addr.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+            } else {
+                false
+            }
+        });
+        assert!(
+            connect_event.is_some(),
+            "Expected at least one Connect event with remote_addr 127.0.0.1 and success=true. Intercepted events: {:?}",
+            events
+        );
+
+        // 2. Минимум одно Data Tx, чей bytes содержит b"POST /api/v1/state"
+        let tx_event = events.iter().find(|e| {
+            if let NetworkEventPayload::Data {
+                direction: NetworkDirection::Tx,
+                bytes,
+                ..
+            } = &e.payload
+            {
+                bytes
+                    .windows(b"POST /api/v1/state".len())
+                    .any(|w| w == b"POST /api/v1/state")
+            } else {
+                false
+            }
+        });
+        assert!(
+            tx_event.is_some(),
+            "Expected at least one Data Tx event containing b\"POST /api/v1/state\". Intercepted events: {:?}",
+            events
+        );
+
+        // 3. Минимум одно Data Rx, чей bytes содержит b"HTTP/1.1 200 OK"
+        let rx_event = events.iter().find(|e| {
+            if let NetworkEventPayload::Data {
+                direction: NetworkDirection::Rx,
+                bytes,
+                ..
+            } = &e.payload
+            {
+                bytes
+                    .windows(b"HTTP/1.1 200 OK".len())
+                    .any(|w| w == b"HTTP/1.1 200 OK")
+            } else {
+                false
+            }
+        });
+        assert!(
+            rx_event.is_some(),
+            "Expected at least one Data Rx event containing b\"HTTP/1.1 200 OK\". Intercepted events: {:?}",
+            events
+        );
+
+        // 4. Все seq различны
+        let mut seen_seqs = std::collections::HashSet::new();
+        for e in &events {
+            assert!(
+                seen_seqs.insert(e.seq),
+                "Duplicate seq detected: {} in event {:?}",
+                e.seq,
+                e
+            );
+        }
+
+        // 5. Для Tx-кадра запроса и Rx-кадра с теми же байтами у Tx seq строго меньше, чем у Rx
+        let tx = tx_event.unwrap();
+        let rx = rx_event.unwrap();
+        assert!(
+            tx.seq < rx.seq,
+            "Tx seq ({}) must be strictly less than Rx seq ({})",
+            tx.seq,
+            rx.seq
+        );
+
+        // 6. Для каждого socket событие Close имеет seq больше, чем все его Data
+        for close_event in &events {
+            if let NetworkEventPayload::Close { socket } = close_event.payload {
+                for data_event in &events {
+                    if let NetworkEventPayload::Data {
+                        socket: data_sock, ..
+                    } = data_event.payload
+                        && data_sock == socket
+                    {
+                        assert!(
+                            close_event.seq > data_event.seq,
+                            "For socket {}, Close seq ({}) must be strictly greater than Data seq ({})",
+                            socket,
+                            close_event.seq,
+                            data_event.seq
+                        );
+                    }
+                }
+            }
+        }
     }
 }

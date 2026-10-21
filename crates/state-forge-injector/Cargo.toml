@@ -5,3 +5,8 @@ edition = "2024"
 
 [dependencies]
 windows-sys = { workspace = true }
+
+[dev-dependencies]
+state-forge-common = { path = "../state-forge-common" }
+tokio = { workspace = true }
+

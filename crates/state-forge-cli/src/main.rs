@@ -114,6 +114,56 @@ pub fn format_hex_dump(bytes: &[u8], max_len: usize) -> String {
     }
 }
 
+/// Форматирование текстовой строки события для логгера
+pub fn format_event_log_line(event: &InterceptedEvent) -> String {
+    match &event.payload {
+        NetworkEventPayload::Connect {
+            socket,
+            remote_addr,
+            success,
+        } => {
+            format!(
+                "[{}] seq={} CONNECT socket={} remote={:?} success={}",
+                event.timestamp_millis, event.seq, socket, remote_addr, success
+            )
+        }
+        NetworkEventPayload::Data {
+            socket,
+            direction,
+            original_len,
+            bytes,
+        } => {
+            let dir_str = match direction {
+                NetworkDirection::Tx => "TX >>> (SEND)",
+                NetworkDirection::Rx => "RX <<< (RECV)",
+            };
+            let dump = format_hex_dump(bytes, 48);
+            format!(
+                "[{}] seq={} DATA socket={} dir={} orig_len={} bytes={} dump={}",
+                event.timestamp_millis,
+                event.seq,
+                socket,
+                dir_str,
+                original_len,
+                bytes.len(),
+                dump
+            )
+        }
+        NetworkEventPayload::Close { socket } => {
+            format!(
+                "[{}] seq={} CLOSE socket={}",
+                event.timestamp_millis, event.seq, socket
+            )
+        }
+        NetworkEventPayload::PeerClosed { socket } => {
+            format!(
+                "[{}] seq={} PEER_CLOSED socket={}",
+                event.timestamp_millis, event.seq, socket
+            )
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -196,27 +246,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = jfile.flush();
             }
 
+            let log_line = format_event_log_line(&event);
+            if let Some(ref mut tfile) = text_log_file {
+                let _ = writeln!(tfile, "{}", log_line);
+                let _ = tfile.flush();
+            }
+
             match &event.payload {
                 NetworkEventPayload::Connect {
                     socket,
                     remote_addr,
                     success,
                 } => {
-                    let log_line = format!(
-                        "[{}] seq={} CONNECT socket={} remote={:?} success={}",
-                        event.timestamp_millis, event.seq, socket, remote_addr, success
-                    );
                     info!(
                         seq = event.seq,
                         socket = socket,
                         remote = ?remote_addr,
                         success = success,
-                        "🔗 [CONNECT] Попытка сетевого соединения"
+                        "🔗 [CONNECT] Попытка сетевого соединения (seq={})",
+                        event.seq
                     );
-                    if let Some(ref mut tfile) = text_log_file {
-                        let _ = writeln!(tfile, "{}", log_line);
-                        let _ = tfile.flush();
-                    }
                 }
                 NetworkEventPayload::Data {
                     socket,
@@ -229,17 +278,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         NetworkDirection::Rx => "RX <<< (RECV)",
                     };
                     let dump = format_hex_dump(bytes, 48);
-
-                    let log_line = format!(
-                        "[{}] seq={} DATA socket={} dir={} orig_len={} bytes={} dump={}",
-                        event.timestamp_millis,
-                        event.seq,
-                        socket,
-                        dir_str,
-                        original_len,
-                        bytes.len(),
-                        dump
-                    );
                     info!(
                         seq = event.seq,
                         socket = socket,
@@ -247,38 +285,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         orig_len = original_len,
                         bytes = bytes.len(),
                         dump = %dump,
-                        "📦 [PACKET]"
+                        "📦 [PACKET] (seq={})",
+                        event.seq
                     );
-                    if let Some(ref mut tfile) = text_log_file {
-                        let _ = writeln!(tfile, "{}", log_line);
-                        let _ = tfile.flush();
-                    }
                 }
                 NetworkEventPayload::Close { socket } => {
-                    let log_line = format!(
-                        "[{}] seq={} CLOSE socket={}",
-                        event.timestamp_millis, event.seq, socket
-                    );
-                    info!(seq = event.seq, socket = socket, "🔌 [CLOSE] Сокет закрыт");
-                    if let Some(ref mut tfile) = text_log_file {
-                        let _ = writeln!(tfile, "{}", log_line);
-                        let _ = tfile.flush();
-                    }
-                }
-                NetworkEventPayload::PeerClosed { socket } => {
-                    let log_line = format!(
-                        "[{}] seq={} PEER_CLOSED socket={}",
-                        event.timestamp_millis, event.seq, socket
-                    );
                     info!(
                         seq = event.seq,
                         socket = socket,
-                        "🚪 [PEER_CLOSED] Соединение закрыто удалённым пиром"
+                        "🔌 [CLOSE] Сокет закрыт (seq={})",
+                        event.seq
                     );
-                    if let Some(ref mut tfile) = text_log_file {
-                        let _ = writeln!(tfile, "{}", log_line);
-                        let _ = tfile.flush();
-                    }
+                }
+                NetworkEventPayload::PeerClosed { socket } => {
+                    info!(
+                        seq = event.seq,
+                        socket = socket,
+                        "🚪 [PEER_CLOSED] Соединение закрыто удалённым пиром (seq={})",
+                        event.seq
+                    );
                 }
             }
         }
@@ -306,18 +331,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut reader = pipe_server;
 
-    // Цикл чтения структурированных сообщений из Named Pipe
+    // Цикл чтения структурированных сообщений из Named Pipe с поддержкой Ctrl+C
     loop {
-        match read_frame_async(&mut reader).await {
-            Ok(Some(event)) => {
-                if tx.send(event).await.is_err() {
-                    break;
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => {
+                match res {
+                    Ok(()) => info!("Получен сигнал Ctrl+C, завершение перехвата..."),
+                    Err(e) => warn!("Ошибка ожидания сигнала Ctrl+C: {}", e),
                 }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                warn!("Ошибка чтения кадра IPC: {}", e);
                 break;
+            }
+            frame_res = read_frame_async(&mut reader) => {
+                match frame_res {
+                    Ok(Some(event)) => {
+                        if tx.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!("Ошибка чтения кадра IPC: {}", e);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -416,5 +452,70 @@ mod tests {
         let mut cursor = Cursor::new(Vec::<u8>::new());
         let res = read_frame_async(&mut cursor).await.unwrap();
         assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_format_event_log_line_all_variants() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // 1. Connect
+        let connect_ev = InterceptedEvent {
+            pid: 1000,
+            seq: 42,
+            timestamp_millis: 1700000000123,
+            payload: NetworkEventPayload::Connect {
+                socket: 1234,
+                remote_addr: Some(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                    8080,
+                )),
+                success: true,
+            },
+        };
+        assert_eq!(
+            format_event_log_line(&connect_ev),
+            "[1700000000123] seq=42 CONNECT socket=1234 remote=Some(127.0.0.1:8080) success=true"
+        );
+
+        // 2. Data Tx
+        let data_tx_ev = InterceptedEvent {
+            pid: 1000,
+            seq: 43,
+            timestamp_millis: 1700000000456,
+            payload: NetworkEventPayload::Data {
+                socket: 1234,
+                direction: NetworkDirection::Tx,
+                original_len: 5,
+                bytes: b"hello".to_vec(),
+            },
+        };
+        assert_eq!(
+            format_event_log_line(&data_tx_ev),
+            "[1700000000456] seq=43 DATA socket=1234 dir=TX >>> (SEND) orig_len=5 bytes=5 dump=68 65 6C 6C 6F [ASCII: hello]"
+        );
+
+        // 3. Close
+        let close_ev = InterceptedEvent {
+            pid: 1000,
+            seq: 44,
+            timestamp_millis: 1700000000789,
+            payload: NetworkEventPayload::Close { socket: 1234 },
+        };
+        assert_eq!(
+            format_event_log_line(&close_ev),
+            "[1700000000789] seq=44 CLOSE socket=1234"
+        );
+
+        // 4. PeerClosed
+        let peer_closed_ev = InterceptedEvent {
+            pid: 1000,
+            seq: 45,
+            timestamp_millis: 1700000000999,
+            payload: NetworkEventPayload::PeerClosed { socket: 1234 },
+        };
+        assert_eq!(
+            format_event_log_line(&peer_closed_ev),
+            "[1700000000999] seq=45 PEER_CLOSED socket=1234"
+        );
     }
 }
