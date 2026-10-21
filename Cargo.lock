@@ -312,6 +312,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "state-forge-analyzer"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "state-forge-common",
+]
+
+[[package]]
 name = "state-forge-cli"
 version = "0.1.0"
 dependencies = [

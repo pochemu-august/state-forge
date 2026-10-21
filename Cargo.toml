@@ -6,6 +6,7 @@ members = [
     "crates/state-forge-injector",
     "crates/state-forge-cli",
     "crates/test-target",
+    "crates/state-forge-analyzer",
 ]
 
 [workspace.dependencies]
